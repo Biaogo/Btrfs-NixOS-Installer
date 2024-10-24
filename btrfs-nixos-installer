@@ -294,6 +294,7 @@ setup_disk() {
         ["nix"]="@nix"
         ["var/log"]="@log"
         [".snapshots"]="@.snapshots"
+        ["boot"]="boot"
     )
     [ "$create_swap" = "yes" ] && mount_points["swap"]="@swap"
 
