@@ -1,0 +1,477 @@
+#!/bin/bash
+
+set -euo pipefail
+trap 'echo "Error on line $LINENO"' ERR
+
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly CYAN='\033[0;36m'
+readonly NC='\033[0m'
+
+declare -A DEFAULTS=(
+    [lang]="zh_CN"
+    [timezone]="Asia/Shanghai"
+    [keyboard]="us"
+    [name]="NixOS"
+    [login_name]="nixos"
+    [hostname]="nixos"
+    [desktop]="plasma6"
+    [allow_unfree]="true"
+    [version]="unstable"
+    [firefox]="no"
+)
+
+readonly CONFIG_DIR="/tmp"
+readonly MOUNT_POINT="/mnt"
+
+print_message() {
+    local color=$1
+    local message=$2
+    echo -e "${color}${message}${NC}"
+}
+
+prompt_yes_no() {
+    local prompt=$1
+    local default=${2:-no}
+    read -p "${prompt} (Default: ${default}) " response
+    echo "${response:-$default}"
+}
+
+get_user_input() {
+    local prompt=$1
+    local default=$2
+    local is_password=${3:-false}
+    
+    if [ "$is_password" = true ]; then
+        read -s -p "${prompt}: " value
+        echo
+    else
+        read -p "${prompt} (Default: ${default}): " value
+    fi
+    
+    echo "${value:-$default}"
+}
+
+validate_desktop() {
+    local desktop=$1
+    local valid_desktops=("budgie" "deepin" "gnome" "mate" "plasma5" "xfce" "cinnamon" "enlightenment" "lxqt" "pantheon" "plasma6")
+    
+    for valid_desktop in "${valid_desktops[@]}"; do
+        if [ "$desktop" = "$valid_desktop" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+setup_display_manager() {
+    local desktop=$1
+    case "$desktop" in
+        plasma5|plasma6)
+            echo "sddm"
+            ;;
+        gnome)
+            echo "gdm"
+            ;;
+        *)
+            echo "lightdm"
+            ;;
+    esac
+}
+
+generate_configuration_nix() {
+    local config_file=$1
+    local lang=$2
+    local timezone=$3
+    local keyboard=$4
+    local name=$5
+    local login_name=$6
+    local password=$7
+    local hostname=$8
+    local desktop=$9
+    local display=${10}
+    local allow_unfree=${11}
+    local version=${12}
+    local plasmapp=${13}
+    local lxqt_mate_conf=${14}
+    local enlightenment_conf=${15}
+    local firefox_conf=${16}
+
+    cat <<EOF > "$config_file"
+{ config, pkgs, ... }:
+
+{
+  imports =
+    [
+      ./hardware-configuration.nix
+    ];
+
+  boot.loader.systemd-boot.enable = true;
+  boot.loader.efi.canTouchEfiVariables = true;
+
+  networking.hostName = "$hostname";
+  networking.networkmanager.enable = true;
+
+  ${lxqt_mate_conf}
+
+  time.timeZone = "$timezone";
+
+  i18n.defaultLocale = "${lang}.UTF-8";
+
+  i18n.extraLocaleSettings = {
+    LC_ADDRESS = "${lang}.UTF-8";
+    LC_IDENTIFICATION = "${lang}.UTF-8";
+    LC_MEASUREMENT = "${lang}.UTF-8";
+    LC_MONETARY = "${lang}.UTF-8";
+    LC_NAME = "${lang}.UTF-8";
+    LC_NUMERIC = "${lang}.UTF-8";
+    LC_PAPER = "${lang}.UTF-8";
+    LC_TELEPHONE = "${lang}.UTF-8";
+    LC_TIME = "${lang}.UTF-8";
+  };
+
+  services.xserver = {
+    enable = true;
+    displayManager.${display}.enable = true;
+    desktopManager.${desktop}.enable = true;
+    xkb = {
+      layout = "$keyboard";
+      variant = "";
+    };
+  };
+
+  ${enlightenment_conf}
+
+  services.printing.enable = true;
+
+  hardware.pulseaudio.enable = false;
+  security.rtkit.enable = true;
+  services.pipewire = {
+    enable = true;
+    alsa.enable = true;
+    alsa.support32Bit = true;
+    pulse.enable = true;
+  };
+
+  users.users.$login_name = {
+    isNormalUser = true;
+    description = "$name";
+    initialPassword = "$password";
+    extraGroups = [ "networkmanager" "wheel" ];
+    packages = with pkgs; [
+      ${plasmapp}
+    ];
+  };
+
+  ${firefox_conf}
+
+  nixpkgs.config.allowUnfree = ${allow_unfree};
+
+  environment.systemPackages = with pkgs; [
+    git
+    wget
+    curl
+  ];
+
+  system.stateVersion = "${version}";
+}
+EOF
+}
+
+generate_hardware_configuration() {
+    local config_file=$1
+    local root_uuid=$2
+    local efi_uuid=$3
+    local ssd_option=$4
+    local create_swap=$5
+
+    cat <<EOF > "$config_file"
+{ config, lib, pkgs, modulesPath, ... }:
+
+{
+  imports =
+    [ (modulesPath + "/installer/scan/not-detected.nix")
+    ];
+
+  boot.initrd.availableKernelModules = [ "xhci_pci" "thunderbolt" "vmd" "nvme" "usb_storage" "usbhid" "sd_mod" ];
+  boot.initrd.kernelModules = [ ];
+  boot.kernelModules = [ "kvm-intel" ];
+  boot.extraModulePackages = [ ];
+
+  fileSystems."/" =
+    { device = "/dev/disk/by-uuid/$root_uuid";
+      fsType = "btrfs";
+      options = [ "rw" "relatime" "compress=zstd:3" "$ssd_option" "discard=async" "space_cache=v2" "subvol=/@" ];
+    };
+
+  fileSystems."/.snapshots" =
+    { device = "/dev/disk/by-uuid/$root_uuid";
+      fsType = "btrfs";
+      options = [ "rw" "relatime" "compress=zstd:3" "$ssd_option" "discard=async" "space_cache=v2" "subvol=/@.snapshots" ];
+    };
+
+  fileSystems."/nix" =
+    { device = "/dev/disk/by-uuid/$root_uuid";
+      fsType = "btrfs";
+      options = [ "rw" "relatime" "compress=zstd:3" "$ssd_option" "discard=async" "space_cache=v2" "subvol=/@nix" ];
+    };
+
+  fileSystems."/home" =
+    { device = "/dev/disk/by-uuid/$root_uuid";
+      fsType = "btrfs";
+      options = [ "rw" "relatime" "compress=zstd:3" "$ssd_option" "discard=async" "space_cache=v2" "subvol=/@home" ];
+    };
+
+  fileSystems."/var/log" =
+    { device = "/dev/disk/by-uuid/$root_uuid";
+      fsType = "btrfs";
+      options = [ "rw" "relatime" "compress=zstd:3" "$ssd_option" "discard=async" "space_cache=v2" "subvol=/@log" ];
+    };
+
+  fileSystems."/boot" =
+    { device = "/dev/disk/by-uuid/$efi_uuid";
+      fsType = "vfat";
+      options = [ "rw" "relatime" "fmask=0022" "dmask=0022" "codepage=437" "iocharset=ascii" "shortname=mixed" "utf8" "errors=remount-ro" ];
+    };
+
+EOF
+
+    if [ "$create_swap" = "yes" ]; then
+        cat <<EOF >> "$config_file"
+  fileSystems."/swap" =
+    { device = "/dev/disk/by-uuid/$root_uuid";
+      fsType = "btrfs";
+      options = [ "subvol=/@swap" ];
+    };
+  swapDevices = [ { device = "/swap/swapfile"; } ];
+EOF
+    fi
+
+    cat <<EOF >> "$config_file"
+
+  networking.useDHCP = lib.mkDefault true;
+
+  nixpkgs.hostPlatform = lib.mkDefault "x86_64-linux";
+  hardware.cpu.intel.updateMicrocode = lib.mkDefault config.hardware.enableRedistributableFirmware;
+}
+EOF
+}
+
+setup_disk() {
+    local disk_device=$1
+    
+    print_message "$GREEN" "Partitioning the disk..."
+    printf "label: gpt\n,550M,U\n,,L\n" | sfdisk "$disk_device"
+
+    print_message "$GREEN" "Formatting partitions..."
+    mkfs.vfat -F 32 "${disk_device}p1"
+    mkfs.btrfs -f "${disk_device}p2"
+
+    print_message "$GREEN" "Mounting and creating subvolumes..."
+    mkdir -p "$MOUNT_POINT"
+    mount "${disk_device}p2" "$MOUNT_POINT"
+
+    local subvolumes=("@" "@home" "@nix" "@log" "@.snapshots")
+    local create_swap=$(prompt_yes_no "Do you want to create a swap subvolume?")
+    [ "$create_swap" = "yes" ] && subvolumes+=("@swap")
+
+    for subvol in "${subvolumes[@]}"; do
+        btrfs subvolume create "$MOUNT_POINT/$subvol"
+    done
+    umount "$MOUNT_POINT"
+
+    local ssd_option="nossd"
+    [[ $(< /sys/block/$(basename "$disk_device")/queue/rotational) == "0" ]] && ssd_option="ssd"
+
+    local mount_opts="rw,relatime,compress=zstd:3,$ssd_option,discard=async,space_cache=v2"
+
+    print_message "$GREEN" "Mounting subvolumes..."
+    mount -o "$mount_opts,subvol=/@" "${disk_device}p2" "$MOUNT_POINT"
+
+    local -A mount_points=(
+        ["home"]="@home"
+        ["nix"]="@nix"
+        ["var/log"]="@log"
+        [".snapshots"]="@.snapshots"
+    )
+    [ "$create_swap" = "yes" ] && mount_points["swap"]="@swap"
+
+    for dir in "${!mount_points[@]}"; do
+        mkdir -p "$MOUNT_POINT/$dir"
+        if [ "$dir" = "boot" ]; then
+            mount -o "rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=utf8,shortname=mixed,utf8,errors=remount-ro" \
+                  "${disk_device}p1" "$MOUNT_POINT/$dir"
+        else
+            mount -o "$mount_opts,subvol=/${mount_points[$dir]}" "${disk_device}p2" "$MOUNT_POINT/$dir"
+        fi
+    done
+
+    if [ "$create_swap" = "yes" ]; then
+        print_message "$GREEN" "Creating swap file..."
+        btrfs filesystem mkswapfile --size 8g --uuid clear "$MOUNT_POINT/swap/swapfile"
+    fi
+
+    local efi_uuid=$(blkid -s UUID -o value "${disk_device}p1")
+    local root_uuid=$(blkid -s UUID -o value "${disk_device}p2")
+
+    print_message "$GREEN" "Generating NixOS configuration..."
+    generate_hardware_configuration "$CONFIG_DIR/hardware-configuration.nix" "$root_uuid" "$efi_uuid" "$ssd_option" "$create_swap"
+}
+
+configure_system() {
+    self_conf=$(prompt_yes_no "Do you want to modify the configuration yourself?")
+    
+    if [ "$self_conf" = "no" ]; then
+        local lang=$(get_user_input "Lang" "${DEFAULTS[lang]}")
+        local timezone=$(get_user_input "TimeZone" "${DEFAULTS[timezone]}")
+        local keyboard=$(get_user_input "KeyBoard" "${DEFAULTS[keyboard]}")
+        local name=$(get_user_input "Name" "${DEFAULTS[name]}")
+        local login_name=$(get_user_input "Login Name" "${DEFAULTS[login_name]}")
+        local password=$(get_user_input "Password" "" true)
+        local root_password=$(get_user_input "Root Password" "" true)
+        local hostname=$(get_user_input "HostName" "${DEFAULTS[hostname]}")
+        local desktop=$(get_user_input "Desktop" "${DEFAULTS[desktop]}")
+        local allow_unfree=$(get_user_input "Allow unfree software" "${DEFAULTS[allow_unfree]}")
+        local version=$(get_user_input "Version" "${DEFAULTS[version]}")
+        local firefox=$(get_user_input "FireFox?" "${DEFAULTS[firefox]}")
+
+        if ! validate_desktop "$desktop"; then
+            print_message "$RED" "Invalid desktop environment selected. Using default: ${DEFAULTS[desktop]}"
+            desktop="${DEFAULTS[desktop]}"
+        fi
+
+        password=$(mkpasswd -m sha-512 "$password")
+        root_password=$(mkpasswd -m sha-512 "$root_password")
+
+        local display=$(setup_display_manager "$desktop")
+        local plasmapp=""
+        local lxqt_mate_conf=""
+        local enlightenment_conf=""
+        local firefox_conf=""
+
+        case "$desktop" in
+            plasma6)
+                plasmapp="kdePackages.kate"
+                ;;
+            plasma5)
+                plasmapp="kate"
+                ;;
+            lxqt|mate)
+                lxqt_mate_conf="programs.nm-applet.enable = true;"
+                ;;
+            enlightenment)
+                enlightenment_conf="services.acpid.enable = true;"
+                ;;
+        esac
+
+        [ "$firefox" = "yes" ] && firefox_conf="programs.firefox.enable = true;"
+
+        generate_configuration_nix "$CONFIG_DIR/configuration.nix" "$lang" "$timezone" "$keyboard" \
+            "$name" "$login_name" "$password" "$hostname" "$desktop" "$display" "$allow_unfree" \
+            "$version" "$plasmapp" "$lxqt_mate_conf" "$enlightenment_conf" "$firefox_conf"
+    fi
+}
+
+setup_partitions() {
+    self_hardware=$(prompt_yes_no "Do you want to modify the hardware configuration yourself?")
+    
+    if [ "$self_hardware" = "no" ]; then
+        fdisk -l
+        
+        local disk_device=""
+        while true; do
+            print_message "$CYAN" "Please enter the hard disk device to use (for example /dev/nvme0n1):"
+            read -r disk_device
+[[ -b "$disk_device" ]] && break
+            print_message "$RED" "Invalid device. Please enter a valid block device."
+        done
+
+        print_message "$YELLOW" "WARNING: This will erase all data on ${disk_device}. Are you sure you want to continue? (yes/no)"
+        read -r response
+        [[ "$response" != "yes" ]] && { print_message "$RED" "Aborting installation."; exit 1; }
+
+        setup_disk "$disk_device"
+    fi
+}
+
+setup_channels() {
+    self_channel=$(prompt_yes_no "Do you want to modify the channel yourself?")
+    
+    if [ "$self_channel" = "no" ]; then
+        print_message "$GREEN" "Updating Nix channels..."
+        nix-channel --list | grep -q "nixos" && nix-channel --remove nixos
+        nix-channel --add https://github.com/nix-community/home-manager/archive/master.tar.gz home-manager
+        nix-channel --add https://nixos.org/channels/nixos-unstable nixos
+        nix-channel --add https://nixos.org/channels/nixpkgs-unstable nixpkgs
+        nix-channel --update
+    fi
+}
+
+check_requirements() {
+    if [ "$(id -u)" -ne 0 ]; then
+        print_message "$RED" "This script must be run as root"
+        exit 1
+    fi
+
+    local required_commands=("mkpasswd" "fdisk" "mkfs.vfat" "mkfs.btrfs" "nixos-install" "blkid" "sfdisk")
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            print_message "$RED" "Required command '$cmd' not found"
+            exit 1
+        fi
+    done
+
+    if [ ! -d "/sys/firmware/efi" ]; then
+        print_message "$YELLOW" "WARNING: System does not appear to be booted in EFI mode"
+        read -p "Continue anyway? (yes/no) " response
+        [[ "$response" != "yes" ]] && exit 1
+    fi
+}
+
+cleanup() {
+    if mountpoint -q "$MOUNT_POINT"; then
+        print_message "$YELLOW" "Cleaning up mounts..."
+        umount -R "$MOUNT_POINT" || true
+    fi
+}
+
+main() {
+    trap cleanup EXIT
+
+    check_requirements
+
+    print_message "$GREEN" "Starting NixOS installation..."
+    print_message "$CYAN" "This script will guide you through the NixOS installation process"
+
+    configure_system
+    setup_partitions
+    setup_channels
+
+    if [ "$self_conf" = "no" ]; then
+        mkdir -p "$MOUNT_POINT/etc/nixos"
+        cp "$CONFIG_DIR/configuration.nix" "$MOUNT_POINT/etc/nixos/"
+        print_message "$GREEN" "Configuration copied to $MOUNT_POINT/etc/nixos/"
+    fi
+    
+    if [ "$self_hardware" = "no" ]; then
+        mkdir -p "$MOUNT_POINT/etc/nixos"
+        cp "$CONFIG_DIR/hardware-configuration.nix" "$MOUNT_POINT/etc/nixos/"
+        print_message "$GREEN" "Hardware configuration copied to $MOUNT_POINT/etc/nixos/"
+    fi
+
+    print_message "$CYAN" "Configuration complete. Ready to install NixOS."
+    print_message "$YELLOW" "Please review the configurations in $MOUNT_POINT/etc/nixos/"
+    read -p "Press Enter to begin installation or Ctrl+C to abort..."
+
+    print_message "$GREEN" "Starting NixOS installation..."
+    nixos-install || {
+        print_message "$RED" "Installation failed!"
+        exit 1
+    }
+
+    print_message "$GREEN" "Installation complete!"
+    print_message "$CYAN" "You can now reboot into your new NixOS system"
+}
+
+main "$@"
