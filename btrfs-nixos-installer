@@ -338,7 +338,6 @@ setup_disk() {
         mkdir -p "$MOUNT_POINT/$dir"
         if [ "$dir" = "boot" ]; then
             mount -o "rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=utf8,shortname=mixed,utf8,errors=remount-ro" "$efi_to_mount" "$MOUNT_POINT/$dir"
-                  "$efi_to_mount" "$MOUNT_POINT/$dir"
         else
             mount -o "$mount_opts,subvol=/${mount_points[$dir]}" "$root_to_mount" "$MOUNT_POINT/$dir"
         fi
