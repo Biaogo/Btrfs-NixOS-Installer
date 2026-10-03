@@ -53,15 +53,18 @@ get_user_input() {
     echo "${value:-$default}"
 }
 
+desktop_choices() {
+    printf '%s\n' none budgie deepin gnome mate plasma5 xfce cinnamon enlightenment lxqt pantheon plasma6
+}
+
 validate_desktop() {
     local desktop=$1
-    local valid_desktops=("budgie" "deepin" "gnome" "mate" "plasma5" "xfce" "cinnamon" "enlightenment" "lxqt" "pantheon" "plasma6")
-    
-    for valid_desktop in "${valid_desktops[@]}"; do
+    local valid_desktop
+    while IFS= read -r valid_desktop; do
         if [ "$desktop" = "$valid_desktop" ]; then
             return 0
         fi
-    done
+    done < <(desktop_choices)
     return 1
 }
 
@@ -98,6 +101,24 @@ generate_configuration_nix() {
     local enlightenment_conf=${15}
     local firefox_conf=${16}
 
+    local session_conf extra_groups
+    extra_groups='"networkmanager" "wheel"'
+    if [ "$desktop" = "none" ]; then
+        # TTY only. Hyprland (or anything else) is installed after boot.
+        session_conf="  console.keyMap = \"${keyboard}\";"
+        extra_groups='"networkmanager" "wheel" "video" "input"'
+    else
+        session_conf="  services.xserver = {
+    enable = true;
+    displayManager.${display}.enable = true;
+    desktopManager.${desktop}.enable = true;
+    xkb = {
+      layout = \"${keyboard}\";
+      variant = \"\";
+    };
+  };"
+    fi
+
     cat <<EOF > "$config_file"
 { config, pkgs, ... }:
 
@@ -131,15 +152,7 @@ generate_configuration_nix() {
     LC_TIME = "${lang}.UTF-8";
   };
 
-  services.xserver = {
-    enable = true;
-    displayManager.${display}.enable = true;
-    desktopManager.${desktop}.enable = true;
-    xkb = {
-      layout = "$keyboard";
-      variant = "";
-    };
-  };
+${session_conf}
 
   ${enlightenment_conf}
 
@@ -158,7 +171,7 @@ generate_configuration_nix() {
     isNormalUser = true;
     description = "$name";
     initialPassword = "$password";
-    extraGroups = [ "networkmanager" "wheel" ];
+    extraGroups = [ ${extra_groups} ];
     packages = with pkgs; [
       ${plasmapp}
     ];
@@ -179,6 +192,74 @@ generate_configuration_nix() {
 EOF
 }
 
+# Stage-1 can only see disks whose drivers are in this list. A hardcoded nvme
+# list leaves SATA, USB and virtio roots invisible: blkid shows the UUID, then
+# boot dies with "special device ... does not exist" on /mnt-root.
+detect_initrd_modules() {
+    local sys=${SYSFS_ROOT:-/sys}
+    local -A seen=()
+    local modules=()
+    local nullglob_was=0
+    shopt -q nullglob && nullglob_was=1
+    shopt -s nullglob
+
+    add_mod() {
+        local m=$1
+        [[ -n "$m" ]] || return 0
+        [[ -n "${seen[$m]:-}" ]] && return 0
+        seen[$m]=1
+        modules+=("$m")
+    }
+
+    add_bound() {
+        local path=$1
+        [[ -e "$path/driver/module" ]] || return 0
+        add_mod "$(basename "$(readlink -f "$path/driver/module")")"
+    }
+
+    local path class vendor device protocol
+    for path in "$sys"/bus/pci/devices/*; do
+        [[ -e "$path/class" ]] || continue
+        class=$(<"$path/class")
+        # Mass storage, Firewire, USB controller (keyboard in the initrd).
+        if [[ "$class" == 0x01* || "$class" == 0x0c00* || "$class" == 0x0c03* ]]; then
+            add_bound "$path"
+        fi
+        if [[ -e "$path/vendor" && -e "$path/device" ]]; then
+            vendor=$(<"$path/vendor")
+            device=$(<"$path/device")
+            if [[ "$vendor" == "0x1af4" && ( "$device" == "0x1004" || "$device" == "0x1048" ) ]]; then
+                add_mod virtio_scsi
+            fi
+        fi
+    done
+
+    for path in "$sys"/bus/usb/devices/*; do
+        [[ -e "$path/bInterfaceClass" && -e "$path/bInterfaceProtocol" ]] || continue
+        class=$(<"$path/bInterfaceClass")
+        protocol=$(<"$path/bInterfaceProtocol")
+        if [[ "$class" == "08" || ( "$class" == "03" && "$protocol" == "01" ) ]]; then
+            add_bound "$path"
+        fi
+    done
+
+    for path in "$sys"/class/block/* "$sys"/class/mmc_host/*; do
+        [[ -e "$path/device/driver/module" ]] || continue
+        add_mod "$(basename "$(readlink -f "$path/device/driver/module")")"
+    done
+
+    # On demand only. vmd is intentionally absent: forcing it when it was not
+    # the bound driver can hide the NVMe device the root UUID lives on.
+    local fallback
+    for fallback in xhci_pci ehci_pci ahci nvme usb_storage usbhid sd_mod uas \
+        virtio_pci virtio_blk virtio_scsi ata_piix sdhci_pci mmc_block thunderbolt; do
+        add_mod "$fallback"
+    done
+
+    [[ "$nullglob_was" -eq 0 ]] && shopt -u nullglob
+    echo "${modules[*]}"
+}
+
 generate_hardware_configuration() {
     local config_file=$1
     local root_uuid=$2
@@ -188,6 +269,18 @@ generate_hardware_configuration() {
     local luks_uuid=$6
     local crypt=$7
 
+    local initrd_modules nix_modules m
+    initrd_modules=$(detect_initrd_modules)
+    nix_modules=""
+    for m in $initrd_modules; do
+        nix_modules+=" \"$m\""
+    done
+
+    local initrd_kernel_modules="[ ]"
+    if [ "$crypt" = "yes" ]; then
+        initrd_kernel_modules='[ "dm-snapshot" ]'
+    fi
+
     cat <<EOF > "$config_file"
 { config, lib, pkgs, modulesPath, ... }:
 
@@ -196,8 +289,8 @@ generate_hardware_configuration() {
     [ (modulesPath + "/installer/scan/not-detected.nix")
     ];
 
-  boot.initrd.availableKernelModules = [ "xhci_pci" "thunderbolt" "vmd" "nvme" "usb_storage" "usbhid" "sd_mod" ];
-  boot.initrd.kernelModules = [ ];
+  boot.initrd.availableKernelModules = [${nix_modules} ];
+  boot.initrd.kernelModules = ${initrd_kernel_modules};
   boot.kernelModules = [ "kvm-intel" ];
   boot.extraModulePackages = [ ];
 
@@ -251,7 +344,10 @@ EOF
     fi
 
     if [ "$crypt" = "yes" ]; then
-	cat <<EOF >> "$config_file"
+        cat <<EOF >> "$config_file"
+  # The btrfs UUID is on the LV. Stage-1 must unlock LUKS and activate LVM
+  # before that UUID exists, or boot times out on /mnt-root.
+  boot.initrd.services.lvm.enable = true;
   boot.initrd.luks.devices = {
     luksroot = {
       device = "/dev/disk/by-uuid/$luks_uuid";
@@ -368,6 +464,9 @@ configure_system() {
         local password=$(get_user_input "Password" "" true)
         local root_password=$(get_user_input "Root Password" "" true)
         local hostname=$(get_user_input "HostName" "${DEFAULTS[hostname]}")
+        local desktop_list
+        desktop_list=$(desktop_choices | tr '\n' ' ')
+        print_message "$CYAN" "Desktop choices: ${desktop_list}"
         local desktop=$(get_user_input "Desktop" "${DEFAULTS[desktop]}")
         local allow_unfree=$(get_user_input "Allow unfree software" "${DEFAULTS[allow_unfree]}")
         local version=$(get_user_input "Version" "${DEFAULTS[version]}")
@@ -511,4 +610,6 @@ main() {
     print_message "$CYAN" "You can now reboot into your new NixOS system"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

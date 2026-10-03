@@ -6,7 +6,9 @@ A streamlined, interactive script for automating NixOS installation with Btrfs s
 
 - 🚀 Automated NixOS installation with smart defaults
 - 📁 Btrfs subvolume layout with compression and SSD optimizations
-- 🖥️ Support for multiple desktop environments (KDE, GNOME, XFCE, etc.)
+- 🖥️ Desktop environments, or none for a TTY
+- 💽 Initrd storage drivers taken from the machine, so the root UUID is visible at boot
+- 🔐 Optional LUKS, with LVM activated in stage-1 before the root UUID is mounted
 - 🔧 Configurable system settings with sensible defaults
 - 💾 Automated disk partitioning with EFI support
 - 🔄 Optional swap file configuration
@@ -37,6 +39,7 @@ The script creates an optimized Btrfs layout with the following subvolumes:
 - Enlightenment
 - LXQt
 - Pantheon
+- none (TTY only, for installing Hyprland or another compositor afterwards)
 
 ## Requirements
 
